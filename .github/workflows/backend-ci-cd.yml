@@ -1,0 +1,195 @@
+# ============================================================================
+# Backend CI/CD Pipeline
+# ============================================================================
+# Runs tests, builds Docker image, scans for vulnerabilities,
+# pushes to ECR, and deploys to EC2 via rolling update.
+# ============================================================================
+
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths: ["backend/**"]
+  pull_request:
+    branches: [main]
+    paths: ["backend/**"]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: starttech-backend
+  GO_VERSION: "1.21"
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Test Stage
+  # -------------------------------------------------------------------------
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage.out
+          fail_ci_if_error: false
+
+  # -------------------------------------------------------------------------
+  # Security Scanning
+  # -------------------------------------------------------------------------
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner on repo
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: backend/
+          format: sarif
+          output: trivy-repo-results.sarif
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-repo-results.sarif
+
+  # -------------------------------------------------------------------------
+  # Build & Push Docker Image
+  # -------------------------------------------------------------------------
+  build-push:
+    name: Build & Push Image
+    needs: [test, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            --tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest \
+            backend/
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: table
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  # -------------------------------------------------------------------------
+  # Deploy to EC2 (Rolling Update)
+  # -------------------------------------------------------------------------
+  deploy:
+    name: Deploy to EC2
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Trigger rolling update
+        run: |
+          # Update launch template with new AMI (new image tag)
+          LT_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ secrets.ASG_NAME }} \
+            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' \
+            --output text)
+
+          CURRENT_VERSION=$(aws ec2 describe-launch-template-versions \
+            --launch-template-id $LT_ID \
+            --query 'LaunchTemplateVersions[-1].VersionNumber' \
+            --output text)
+
+          # Create new version with updated image
+          NEW_VERSION=$(aws ec2 create-launch-template-version \
+            --launch-template-id $LT_ID \
+            --source-version $CURRENT_VERSION \
+            --launch-template-data "ImageId=$(aws ecr describe-images --repository-name ${{ env.ECR_REPOSITORY }} --image-ids imageTag=latest --query 'imageDetails[0].imageDigest' --output text | xargs -I {} aws ecr batch-get-image --repository-name ${{ env.ECR_REPOSITORY }} --image-ids imageDigest={} --query 'images[0].imageId.imageDigest' --output text)" \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+
+          # Start instance refresh (rolling update)
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+            --strategy Rolling \
+            --preferences MinHealthyPercentage=50,InstanceWarmup=300
+
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for instance refresh to complete..."
+          aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+            --query 'InstanceRefreshes[0].Status' \
+            --output text
+
+      - name: Smoke test
+        run: |
+          for i in {1..12}; do
+            STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://${{ secrets.ALB_DNS_NAME }}/health || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "Smoke test passed!"
+              exit 0
+            fi
+            echo "Attempt $i: status $STATUS, retrying in 10s..."
+            sleep 10
+          done
+          echo "Smoke test failed after 12 attempts"
+          exit 1
+
+      - name: Notify deployment
+        if: success()
+        run: |
+          echo "Backend deployed successfully!"
+          echo "API URL: http://${{ secrets.ALB_DNS_NAME }}"
